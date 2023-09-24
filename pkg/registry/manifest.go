@@ -45,10 +45,9 @@ type manifest struct {
 }
 
 type manifests struct {
-	// maps repo -> manifest tag/digest -> manifest
-	manifests map[string]map[string]manifest
-	lock      sync.RWMutex
-	log       *log.Logger
+	manifestHandler ManifestHandler
+	lock            sync.RWMutex
+	log             *log.Logger
 }
 
 func isManifest(req *http.Request) bool {
@@ -102,7 +101,7 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		m.lock.RLock()
 		defer m.lock.RUnlock()
 
-		c, ok := m.manifests[repo]
+		c, ok := m.manifestHandler.GetRepo(repo, req.URL.Query().Get("ns"))
 		if !ok {
 			return &regError{
 				Status:  http.StatusNotFound,
@@ -131,14 +130,14 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		m.lock.RLock()
 		defer m.lock.RUnlock()
 
-		if _, ok := m.manifests[repo]; !ok {
+		if _, ok := m.manifestHandler.GetRepo(repo, req.URL.Query().Get("ns")); !ok {
 			return &regError{
 				Status:  http.StatusNotFound,
 				Code:    "NAME_UNKNOWN",
 				Message: "Unknown name",
 			}
 		}
-		m, ok := m.manifests[repo][target]
+		m, ok := m.manifestHandler.GetManifest(repo, target, req.URL.Query().Get("ns"))
 		if !ok {
 			return &regError{
 				Status:  http.StatusNotFound,
@@ -186,7 +185,7 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 						continue
 					}
 					if desc.MediaType.IsIndex() || desc.MediaType.IsImage() {
-						if _, found := m.manifests[repo][desc.Digest.String()]; !found {
+						if _, found := m.manifestHandler.GetManifest(repo, desc.Digest.String(), req.URL.Query().Get("ns")); !found {
 							return &regError{
 								Status:  http.StatusNotFound,
 								Code:    "MANIFEST_UNKNOWN",
@@ -207,14 +206,14 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		m.lock.Lock()
 		defer m.lock.Unlock()
 
-		if _, ok := m.manifests[repo]; !ok {
-			m.manifests[repo] = make(map[string]manifest, 2)
+		if _, ok := m.manifestHandler.GetRepo(repo, req.URL.Query().Get("ns")); !ok {
+			m.manifestHandler.CreateRepo(repo, req.URL.Query().Get("ns"))
 		}
 
 		// Allow future references by target (tag) and immutable digest.
 		// See https://docs.docker.com/engine/reference/commandline/pull/#pull-an-image-by-digest-immutable-identifier.
-		m.manifests[repo][digest] = mf
-		m.manifests[repo][target] = mf
+		m.manifestHandler.PutManifest(repo, digest, mf, req.URL.Query().Get("ns"))
+		m.manifestHandler.PutManifest(repo, target, mf, req.URL.Query().Get("ns"))
 		resp.Header().Set("Docker-Content-Digest", digest)
 		resp.WriteHeader(http.StatusCreated)
 		return nil
@@ -222,7 +221,7 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 	case http.MethodDelete:
 		m.lock.Lock()
 		defer m.lock.Unlock()
-		if _, ok := m.manifests[repo]; !ok {
+		if _, ok := m.manifestHandler.GetRepo(repo, req.URL.Query().Get("ns")); !ok {
 			return &regError{
 				Status:  http.StatusNotFound,
 				Code:    "NAME_UNKNOWN",
@@ -230,7 +229,7 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 			}
 		}
 
-		_, ok := m.manifests[repo][target]
+		_, ok := m.manifestHandler.GetManifest(repo, target, req.URL.Query().Get("ns"))
 		if !ok {
 			return &regError{
 				Status:  http.StatusNotFound,
@@ -239,7 +238,7 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 			}
 		}
 
-		delete(m.manifests[repo], target)
+		m.manifestHandler.DeleteManifest(repo, target, req.URL.Query().Get("ns"))
 		resp.WriteHeader(http.StatusAccepted)
 		return nil
 
@@ -261,7 +260,7 @@ func (m *manifests) handleTags(resp http.ResponseWriter, req *http.Request) *reg
 		m.lock.RLock()
 		defer m.lock.RUnlock()
 
-		c, ok := m.manifests[repo]
+		c, ok := m.manifestHandler.GetRepo(repo, req.URL.Query().Get("ns"))
 		if !ok {
 			return &regError{
 				Status:  http.StatusNotFound,
@@ -333,17 +332,7 @@ func (m *manifests) handleCatalog(resp http.ResponseWriter, req *http.Request) *
 		m.lock.RLock()
 		defer m.lock.RUnlock()
 
-		var repos []string
-		countRepos := 0
-		// TODO: implement pagination
-		for key := range m.manifests {
-			if countRepos >= n {
-				break
-			}
-			countRepos++
-
-			repos = append(repos, key)
-		}
+		repos := m.manifestHandler.ListRepos(n, req.URL.Query().Get("ns"))
 
 		repositoriesToList := catalog{
 			Repos: repos,
@@ -391,7 +380,7 @@ func (m *manifests) handleReferrers(resp http.ResponseWriter, req *http.Request)
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
-	digestToManifestMap, repoExists := m.manifests[repo]
+	digestToManifestMap, repoExists := m.manifestHandler.GetRepo(repo, req.URL.Query().Get("ns"))
 	if !repoExists {
 		return &regError{
 			Status:  http.StatusNotFound,
@@ -441,4 +430,61 @@ func (m *manifests) handleReferrers(resp http.ResponseWriter, req *http.Request)
 	resp.WriteHeader(http.StatusOK)
 	io.Copy(resp, bytes.NewReader([]byte(msg)))
 	return nil
+}
+
+type manifestMemHandler struct {
+	// maps repo -> manifest tag/digest -> manifest
+	manifests map[string]map[string]manifest
+}
+
+// ManifestHandler represents a minimal manifest storage backend, capable of serving
+// blob contents.
+type ManifestHandler interface {
+	CreateRepo(repo string, ns string)
+	ListRepos(max int, ns string) []string
+	GetRepo(repo string, ns string) (map[string]manifest, bool)
+	PutManifest(repo, tag string, value manifest, ns string)
+	GetManifest(repo, tag string, ns string) (manifest, bool)
+	DeleteManifest(repo, target string, ns string)
+}
+
+func NewInMemoryManifestHandler() ManifestHandler {
+	return &manifestMemHandler{manifests: map[string]map[string]manifest{}}
+}
+
+func (m manifestMemHandler) CreateRepo(repo string, ns string) {
+	m.manifests["/"+ns+"/"+repo] = make(map[string]manifest, 2)
+}
+
+func (m manifestMemHandler) DeleteManifest(repo, target string, ns string) {
+	delete(m.manifests["/"+ns+"/"+repo], target)
+}
+
+func (m manifestMemHandler) ListRepos(n int, ns string) []string {
+	var repos []string
+	countRepos := 0
+	// TODO: implement pagination
+	for key := range m.manifests {
+		if countRepos >= n {
+			break
+		}
+		countRepos++
+
+		repos = append(repos, key)
+	}
+	return repos
+}
+
+func (m manifestMemHandler) GetRepo(repo string, ns string) (map[string]manifest, bool) {
+	man, err := m.manifests["/"+ns+"/"+repo]
+	return man, err
+}
+
+func (m manifestMemHandler) GetManifest(repo, tag string, ns string) (manifest, bool) {
+	man, err := m.manifests["/"+ns+"/"+repo][tag]
+	return man, err
+}
+
+func (m manifestMemHandler) PutManifest(repo, tag string, value manifest, ns string) {
+	m.manifests["/"+ns+"/"+repo][tag] = value
 }

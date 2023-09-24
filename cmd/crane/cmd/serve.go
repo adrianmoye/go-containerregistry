@@ -62,15 +62,17 @@ Contents are only stored in memory, and when the process exits, pushed data is l
 			port = fmt.Sprintf("%d", porti)
 
 			bh := registry.NewInMemoryBlobHandler()
+			mh := registry.NewInMemoryManifestHandler()
 			if disk {
 				tmp := os.TempDir()
 				log.Printf("storing blobs in %s", tmp)
 				bh = registry.NewDiskBlobHandler(tmp)
+				mh = registry.NewDiskManifestHandler(tmp)
 			}
 
 			s := &http.Server{
 				ReadHeaderTimeout: 5 * time.Second, // prevent slowloris, quiet linter
-				Handler:           registry.New(registry.WithBlobHandler(bh)),
+				Handler:           registry.New(registry.WithBlobHandler(bh), registry.WithManifestHandler(mh),),
 			}
 			log.Printf("serving on port %s", port)
 

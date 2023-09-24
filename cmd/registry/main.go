@@ -35,10 +35,14 @@ func main() {
 		log.Fatal(err)
 	}
 	porti := listener.Addr().(*net.TCPAddr).Port
+	mrBlobby := registry.NewDiskBlobHandler("./registry-blobs/")
+	mrManny := registry.NewDiskManifestHandler("./registry-blobs/")
 	log.Printf("serving on port %d", porti)
 	s := &http.Server{
 		ReadHeaderTimeout: 5 * time.Second, // prevent slowloris, quiet linter
 		Handler: registry.New(
+			registry.WithBlobHandler(mrBlobby),
+			registry.WithManifestHandler(mrManny),
 			registry.WithWarning(.01, "Congratulations! You've won a lifetime's supply of free image pulls from this in-memory registry!"),
 		),
 	}
